@@ -75,6 +75,7 @@ class Runner(object):
         print("obs_space: ", self.envs.observation_space)
         print("share_obs_space: ", self.envs.share_observation_space)
         print("act_space: ", self.envs.action_space)
+        self.all_args.num_agents = self.num_agents
         
         # policy network
         if self.algorithm_name == "mat" or self.algorithm_name == "mat_dec":

@@ -30,7 +30,7 @@ class SMACRunner(Runner):
                 # Sample actions
                 values, actions, action_log_probs, rnn_states, rnn_states_critic = self.collect(step)
                 # Obser reward and next obs
-                obs, share_obs, rewards, dones, infos, available_actions = self.envs.step(actions)
+                obs, share_obs, rewards, dones, infos, available_actions = self.envs.step(np.squeeze(actions, axis=-1))
 
                 data = obs, share_obs, rewards, dones, infos, available_actions, \
                        values, actions, action_log_probs, \
@@ -197,7 +197,7 @@ class SMACRunner(Runner):
 
             
             # Obser reward and next obs
-            eval_obs, eval_share_obs, eval_rewards, eval_dones, eval_infos, eval_available_actions = self.eval_envs.step(eval_actions)
+            eval_obs, eval_share_obs, eval_rewards, eval_dones, eval_infos, eval_available_actions = self.eval_envs.step(np.squeeze(eval_actions, axis=-1))
             for eval_i in range(self.n_eval_rollout_threads):
                 one_episode_rewards[eval_i].append(eval_rewards[eval_i])
 

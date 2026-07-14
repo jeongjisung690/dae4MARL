@@ -26,7 +26,14 @@ class SMACv2(StarCraftCapabilityEnvWrapper):
         avail_actions = [self.get_avail_agent_actions(i) for i in range(self.env.n_agents)]
         return obs, state, avail_actions
 
+    def _format_actions(self, actions):
+        actions = np.asarray(actions)
+        if actions.ndim > 1 and actions.shape[-1] == 1:
+            actions = np.squeeze(actions, axis=-1)
+        return [int(action) for action in actions]
+
     def step(self, actions):
+        actions = self._format_actions(actions)
         reward, terminated, info = super().step(actions)
         local_obs = self.get_obs()
         global_state = np.array([self.env.get_state_agent(agent_id) for agent_id in range(self.env.n_agents)])

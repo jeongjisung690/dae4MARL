@@ -30,6 +30,8 @@ def get_config():
             number of env steps to train (default: 10e6)
         --user_name <str>
             [for wandb usage], to specify user's name for simply collecting training data.
+        --wandb_project <str>
+            [for wandb usage], to specify the wandb project name. Defaults to env_name.
         --use_wandb
             [for wandb usage], by default True, will log date to wandb server. or else will use tensorboard to log data.
     
@@ -175,7 +177,8 @@ def get_config():
                         help="Number of parallel envs for rendering rollouts")
     parser.add_argument("--num_env_steps", type=int, default=10e6,
                         help='Number of environment steps to train (default: 10e6)')
-    parser.add_argument("--user_name", type=str, default='marl', help="[for wandb usage], to specify user's name for simply collecting training data.")
+    parser.add_argument("--user_name", type=str, default='j-jiseong-okayama-university', help="[for wandb usage], to specify user's name for simply collecting training data.")
+    parser.add_argument("--wandb_project", type=str, default=None, help="[for wandb usage], to specify the wandb project name. Defaults to env_name.")
     parser.add_argument("--use_wandb", action='store_false', default=True, help="[for wandb usage], by default True, will log date to wandb server. or else will use tensorboard to log data.")
 
     # env parameters
@@ -268,6 +271,25 @@ def get_config():
     parser.add_argument("--use_policy_active_masks",
                         action='store_false', default=True, help="by default True, whether to mask useless data in policy loss.")
     parser.add_argument("--huber_delta", type=float, default=10.0, help=" coefficience of huber loss.")
+    parser.add_argument("--use_dae", action='store_true',
+                        default=False, help="use Direct Advantage Estimation for MAPPO advantages")
+    parser.add_argument("--dae_epoch", type=int, default=1,
+                        help="number of critic/advantage-head DAE updates per training iteration")
+    parser.add_argument("--dae_num_mini_batch", type=int, default=1,
+                        help="number of rollout-thread minibatches for each DAE update")
+    parser.add_argument("--dae_loss_coef", type=float, default=1.0,
+                        help="coefficient for the DAE residual loss")
+    parser.add_argument("--dae_normalize_advantages", action='store_false',
+                        default=True, help="by default True, RMS-normalize DAE advantages before the PPO actor update. If set, do not normalize.")
+    parser.add_argument("--dae_centering", type=str, default="exact",
+                        choices=["none", "exact"], help="policy-centering method for DAE advantages")
+    parser.add_argument("--dae_head_hidden_size", type=int, default=0,
+                        help="hidden width of a dedicated MLP branch for the DAE advantage head "
+                             "(critic features -> hidden -> N*|A| table). 0 keeps the single linear head.")
+    parser.add_argument("--dae_warmup_updates", type=int, default=0,
+                        help="number of training updates over which the actor advantage is linearly blended "
+                             "from GAE (weight 1 at update 0) to DAE (weight 1 afterwards). 0 disables the warmup. "
+                             "The DAE head is trained from the start regardless.")
 
     # run parameters
     parser.add_argument("--use_linear_lr_decay", action='store_true',

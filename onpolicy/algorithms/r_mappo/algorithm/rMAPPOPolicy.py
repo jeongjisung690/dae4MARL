@@ -26,7 +26,8 @@ class R_MAPPOPolicy:
         self.act_space = act_space
 
         self.actor = R_Actor(args, self.obs_space, self.act_space, self.device)
-        self.critic = R_Critic(args, self.share_obs_space, self.device)
+        self.critic = R_Critic(args, self.share_obs_space, self.act_space,
+                               getattr(args, "num_agents", 1), self.device)
 
         self.actor_optimizer = torch.optim.Adam(self.actor.parameters(),
                                                 lr=self.lr, eps=self.opti_eps,
@@ -84,6 +85,43 @@ class R_MAPPOPolicy:
         """
         values, _ = self.critic(cent_obs, rnn_states_critic, masks)
         return values
+
+    def evaluate_dae(self, cent_obs, rnn_states_critic, masks, joint_actions):
+        """
+        Evaluate centralized value and joint-action DAE advantage.
+        """
+        values, advantages, _ = self.critic.evaluate_dae(cent_obs, rnn_states_critic, masks, joint_actions)
+        return values, advantages
+
+    def evaluate_centered_dae(self, cent_obs, rnn_states_critic, masks, joint_actions, joint_action_probs):
+        """
+        Evaluate exactly policy-centered DAE advantage.
+        """
+        values, advantages, _ = self.critic.evaluate_centered_dae(cent_obs,
+                                                                  rnn_states_critic,
+                                                                  masks,
+                                                                  joint_actions,
+                                                                  joint_action_probs)
+        return values, advantages
+
+    def evaluate_dae_sequence(self, cent_obs, rnn_states_critic, masks, joint_actions,
+                              joint_action_probs=None, chunk_length=None):
+        """
+        Evaluate value and (optionally centered) DAE advantage over full time-major
+        sequences, recomputing critic RNN states with truncated BPTT.
+        """
+        return self.critic.evaluate_dae_sequence(cent_obs,
+                                                 rnn_states_critic,
+                                                 masks,
+                                                 joint_actions,
+                                                 joint_action_probs,
+                                                 chunk_length)
+
+    def get_action_probs(self, obs, rnn_states_actor, masks, available_actions=None):
+        """
+        Get factorized policy probabilities for exact DAE centering.
+        """
+        return self.actor.get_action_probs(obs, rnn_states_actor, masks, available_actions)
 
     def evaluate_actions(self, cent_obs, obs, rnn_states_actor, rnn_states_critic, action, masks,
                          available_actions=None, active_masks=None):

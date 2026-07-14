@@ -182,6 +182,7 @@ class SharedReplayBuffer(object):
         :param next_value: (np.ndarray) value predictions for the step after the last episode step.
         :param value_normalizer: (PopArt) If not None, PopArt value normalizer instance.
         """
+        self.next_value = next_value.copy()
         if self._use_proper_time_limits:
             if self._use_gae:
                 self.value_preds[-1] = next_value

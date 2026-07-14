@@ -116,6 +116,23 @@ class R_Actor(nn.Module):
 
         return action_log_probs, dist_entropy
 
+    def get_action_probs(self, obs, rnn_states, masks, available_actions=None):
+        """
+        Compute action probabilities for all discrete actions.
+        """
+        obs = check(obs).to(**self.tpdv)
+        rnn_states = check(rnn_states).to(**self.tpdv)
+        masks = check(masks).to(**self.tpdv)
+        if available_actions is not None:
+            available_actions = check(available_actions).to(**self.tpdv)
+
+        actor_features = self.base(obs)
+
+        if self._use_naive_recurrent_policy or self._use_recurrent_policy:
+            actor_features, _ = self.rnn(actor_features, rnn_states, masks)
+
+        return self.act.get_probs(actor_features, available_actions)
+
 
 class R_Critic(nn.Module):
     """
@@ -125,14 +142,20 @@ class R_Critic(nn.Module):
     :param cent_obs_space: (gym.Space) (centralized) observation space.
     :param device: (torch.device) specifies the device to run on (cpu/gpu).
     """
-    def __init__(self, args, cent_obs_space, device=torch.device("cpu")):
+    def __init__(self, args, cent_obs_space, action_space=None, num_agents=1, device=torch.device("cpu")):
         super(R_Critic, self).__init__()
+        if isinstance(action_space, (torch.device, str)):
+            device = action_space
+            action_space = None
         self.hidden_size = args.hidden_size
         self._use_orthogonal = args.use_orthogonal
         self._use_naive_recurrent_policy = args.use_naive_recurrent_policy
         self._use_recurrent_policy = args.use_recurrent_policy
         self._recurrent_N = args.recurrent_N
         self._use_popart = args.use_popart
+        self._use_dae = getattr(args, "use_dae", False)
+        self.num_agents = num_agents
+        self.action_space = action_space
         self.tpdv = dict(dtype=torch.float32, device=device)
         init_method = [nn.init.xavier_uniform_, nn.init.orthogonal_][self._use_orthogonal]
 
@@ -151,7 +174,57 @@ class R_Critic(nn.Module):
         else:
             self.v_out = init_(nn.Linear(self.hidden_size, 1))
 
+        if self._use_dae:
+            if action_space is None:
+                raise ValueError("DAE critic requires action_space.")
+            if action_space.__class__.__name__ != "Discrete":
+                raise NotImplementedError("Initial DAE-MAPPO implementation supports Discrete action spaces.")
+            self.action_dim = action_space.n
+            # small init gain for the output layer, following the official DAE
+            # implementation (module_gains: advantage_net=0.1)
+            dae_head_hidden_size = getattr(args, "dae_head_hidden_size", 0)
+            if dae_head_hidden_size > 0:
+                use_relu = args.use_ReLU
+                active_fn = nn.ReLU() if use_relu else nn.Tanh()
+                hidden_gain = nn.init.calculate_gain('relu' if use_relu else 'tanh')
+                self.adv_out = nn.Sequential(
+                    init(nn.Linear(self.hidden_size, dae_head_hidden_size),
+                         init_method, lambda x: nn.init.constant_(x, 0), gain=hidden_gain),
+                    active_fn,
+                    nn.LayerNorm(dae_head_hidden_size),
+                    init(nn.Linear(dae_head_hidden_size, self.num_agents * self.action_dim),
+                         init_method, lambda x: nn.init.constant_(x, 0), gain=0.1),
+                )
+            else:
+                self.adv_out = init(nn.Linear(self.hidden_size, self.num_agents * self.action_dim),
+                                    init_method, lambda x: nn.init.constant_(x, 0), gain=0.1)
+
         self.to(device)
+
+    def _features(self, cent_obs, rnn_states, masks):
+        cent_obs = check(cent_obs).to(**self.tpdv)
+        rnn_states = check(rnn_states).to(**self.tpdv)
+        masks = check(masks).to(**self.tpdv)
+
+        critic_features = self.base(cent_obs)
+        if self._use_naive_recurrent_policy or self._use_recurrent_policy:
+            critic_features, rnn_states = self.rnn(critic_features, rnn_states, masks)
+        return critic_features, rnn_states
+
+    def _advantage_table(self, critic_features):
+        advantages = self.adv_out(critic_features)
+        return advantages.view(-1, self.num_agents, self.action_dim)
+
+    def _joint_action_indices(self, joint_actions):
+        joint_actions = check(joint_actions).to(device=self.tpdv["device"])
+        joint_actions = joint_actions.long().view(joint_actions.shape[0], self.num_agents, -1)
+        joint_actions = joint_actions[..., 0].clamp(min=0, max=self.action_dim - 1)
+        return joint_actions
+
+    def _gather_joint_advantages(self, advantage_table, joint_actions):
+        joint_actions = self._joint_action_indices(joint_actions)
+        advantages = advantage_table.gather(dim=-1, index=joint_actions.unsqueeze(-1))
+        return advantages.sum(dim=1)
 
     def forward(self, cent_obs, rnn_states, masks):
         """
@@ -163,13 +236,96 @@ class R_Critic(nn.Module):
         :return values: (torch.Tensor) value function predictions.
         :return rnn_states: (torch.Tensor) updated RNN hidden states.
         """
+        critic_features, rnn_states = self._features(cent_obs, rnn_states, masks)
+        values = self.v_out(critic_features)
+
+        return values, rnn_states
+
+    def evaluate_dae(self, cent_obs, rnn_states, masks, joint_actions):
+        if not self._use_dae:
+            raise RuntimeError("evaluate_dae called when DAE is disabled.")
+
+        critic_features, rnn_states = self._features(cent_obs, rnn_states, masks)
+        values = self.v_out(critic_features)
+        advantage_table = self._advantage_table(critic_features)
+        advantages = self._gather_joint_advantages(advantage_table, joint_actions)
+
+        return values, advantages, rnn_states
+
+    def evaluate_centered_dae(self, cent_obs, rnn_states, masks, joint_actions, joint_action_probs):
+        if not self._use_dae:
+            raise RuntimeError("evaluate_centered_dae called when DAE is disabled.")
+
+        critic_features, rnn_states = self._features(cent_obs, rnn_states, masks)
+        joint_action_probs = check(joint_action_probs).to(**self.tpdv)
+        joint_action_probs = joint_action_probs.view(joint_action_probs.shape[0],
+                                                     self.num_agents,
+                                                     self.action_dim)
+
+        values = self.v_out(critic_features)
+        advantage_table = self._advantage_table(critic_features)
+        expected_advantages = (joint_action_probs * advantage_table).sum(dim=-1, keepdim=True)
+        centered_advantage_table = advantage_table - expected_advantages
+        advantages = self._gather_joint_advantages(centered_advantage_table, joint_actions)
+
+        return values, advantages, rnn_states
+
+    def _sequence_features(self, cent_obs, rnn_states, masks, chunk_length=None):
+        """
+        Run the critic over full time-major sequences, recomputing RNN hidden
+        states in the forward pass with truncated BPTT.
+        :param cent_obs: (T * B, obs_dim) time-major flattened sequence.
+        :param rnn_states: (B, recurrent_N, hidden_size) hidden states at the start of the sequence.
+        :param masks: (T * B, 1) mask tensor; zeros reset the hidden state at episode boundaries.
+        :param chunk_length: (int) BPTT truncation length; hidden states are detached between chunks.
+        """
         cent_obs = check(cent_obs).to(**self.tpdv)
         rnn_states = check(rnn_states).to(**self.tpdv)
         masks = check(masks).to(**self.tpdv)
 
         critic_features = self.base(cent_obs)
-        if self._use_naive_recurrent_policy or self._use_recurrent_policy:
-            critic_features, rnn_states = self.rnn(critic_features, rnn_states, masks)
-        values = self.v_out(critic_features)
+        if not (self._use_naive_recurrent_policy or self._use_recurrent_policy):
+            return critic_features
 
-        return values, rnn_states
+        batch = rnn_states.size(0)
+        steps = critic_features.size(0) // batch
+        if chunk_length is None or chunk_length >= steps:
+            critic_features, _ = self.rnn(critic_features, rnn_states, masks)
+            return critic_features
+
+        features = critic_features.view(steps, batch, -1)
+        masks = masks.view(steps, batch, -1)
+        hxs = rnn_states
+        outputs = []
+        for start in range(0, steps, chunk_length):
+            end = min(start + chunk_length, steps)
+            chunk_features, hxs = self.rnn(features[start:end].reshape((end - start) * batch, -1),
+                                           hxs,
+                                           masks[start:end].reshape((end - start) * batch, -1))
+            hxs = hxs.detach()
+            outputs.append(chunk_features)
+        return torch.cat(outputs, dim=0).view(steps * batch, -1)
+
+    def evaluate_dae_sequence(self, cent_obs, rnn_states, masks, joint_actions,
+                              joint_action_probs=None, chunk_length=None):
+        """
+        Evaluate values and (optionally centered) DAE advantages over full
+        time-major sequences with truncated BPTT, so the recurrent critic is
+        trained through time instead of from stale per-step rollout states.
+        """
+        if not self._use_dae:
+            raise RuntimeError("evaluate_dae_sequence called when DAE is disabled.")
+
+        critic_features = self._sequence_features(cent_obs, rnn_states, masks, chunk_length)
+        values = self.v_out(critic_features)
+        advantage_table = self._advantage_table(critic_features)
+        if joint_action_probs is not None:
+            joint_action_probs = check(joint_action_probs).to(**self.tpdv)
+            joint_action_probs = joint_action_probs.view(joint_action_probs.shape[0],
+                                                         self.num_agents,
+                                                         self.action_dim)
+            expected_advantages = (joint_action_probs * advantage_table).sum(dim=-1, keepdim=True)
+            advantage_table = advantage_table - expected_advantages
+        advantages = self._gather_joint_advantages(advantage_table, joint_actions)
+
+        return values, advantages
