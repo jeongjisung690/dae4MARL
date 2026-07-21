@@ -171,6 +171,13 @@ def get_config():
                         default=1, help="Number of torch threads for training")
     parser.add_argument("--n_rollout_threads", type=int, default=32,
                         help="Number of parallel envs for training rollouts")
+    parser.add_argument("--rollout_accumulation", type=int, default=1,
+                        help="Number of sequential rollout chunks collected (without any policy update in "
+                             "between) before each training update. The chunks are concatenated along the "
+                             "thread dimension, so the update batch is statistically equivalent to "
+                             "n_rollout_threads * rollout_accumulation parallel envs while only "
+                             "n_rollout_threads env processes exist. Currently implemented in the "
+                             "shared-policy SMAC runner only.")
     parser.add_argument("--n_eval_rollout_threads", type=int, default=1,
                         help="Number of parallel envs for evaluating rollouts")
     parser.add_argument("--n_render_rollout_threads", type=int, default=1,
@@ -283,6 +290,10 @@ def get_config():
                         default=True, help="by default True, RMS-normalize DAE advantages before the PPO actor update. If set, do not normalize.")
     parser.add_argument("--dae_centering", type=str, default="exact",
                         choices=["none", "exact"], help="policy-centering method for DAE advantages")
+    parser.add_argument("--dae_head_gain", type=float, default=1.0,
+                        help="orthogonal-init gain of the DAE advantage head output layer. 1.0 matches the "
+                             "well-performing 7/14 run (rtsr13vx); 0.1 is the official-DAE-style small init "
+                             "that was silently introduced right after that run and degraded learning.")
     parser.add_argument("--dae_head_hidden_size", type=int, default=0,
                         help="hidden width of a dedicated MLP branch for the DAE advantage head "
                              "(critic features -> hidden -> N*|A| table). 0 keeps the single linear head.")
@@ -290,6 +301,62 @@ def get_config():
                         help="number of training updates over which the actor advantage is linearly blended "
                              "from GAE (weight 1 at update 0) to DAE (weight 1 afterwards). 0 disables the warmup. "
                              "The DAE head is trained from the start regardless.")
+    parser.add_argument("--dae_head", type=str, default="additive",
+                        choices=["additive", "ordered"],
+                        help="advantage head function class. 'additive': per-agent factors A_i(s, a_i). "
+                             "'ordered': factors conditioned on preceding agents' actions A_i(s, a_<i, a_i) "
+                             "(Multi-Agent Advantage Decomposition / O-DAE).")
+    parser.add_argument("--dae_actor_adv", type=str, default="joint",
+                        choices=["joint", "agent"],
+                        help="advantage signal passed to the actor. 'joint': the summed joint advantage, "
+                             "identical for all agents. 'agent': each agent's own centered factor.")
+    parser.add_argument("--dae_order", type=str, default="fixed",
+                        choices=["fixed", "permute"],
+                        help="agent ordering for the ordered DAE head. 'fixed': agent-index order. "
+                             "'permute': a fresh random permutation per rollout thread on every evaluation.")
+    parser.add_argument("--dae_adv_norm_scope", type=str, default="global",
+                        choices=["global", "agent"],
+                        help="scope of the RMS normalization of DAE actor advantages. 'global' preserves "
+                             "relative credit scale between agents; 'agent' normalizes each agent separately.")
+    parser.add_argument("--dae_perm_eval_samples", type=int, default=1,
+                        help="with dae_order=permute, number of permutations averaged when computing actor "
+                             "advantages (Shapley-style permutation averaging). Training still uses one "
+                             "permutation per rollout thread per update.")
+    parser.add_argument("--dae_gpae_coef", type=float, default=0.0,
+                        help="weight of the GPAE auxiliary loss that ties the ordered head's "
+                             "last-position (fully conditioned) factor A_k(s, a_-k, a_k) to a "
+                             "reward-grounded per-agent GPAE target. The target comes from a "
+                             "dedicated counterfactual-value head E_Q^k(s, a_-k) trained with the "
+                             "per-agent n-step recursion of Kim et al. (GPAE, AAMAS 2026). "
+                             "0 (default) disables the head and the loss. Requires dae_head=ordered "
+                             "and dae_centering=exact.")
+    parser.add_argument("--dae_gpae_lambda", type=float, default=0.95,
+                        help="lambda of the per-agent GPAE advantage recursion "
+                             "(bias-variance trade-off, as in GAE).")
+    parser.add_argument("--dae_replay_size", type=int, default=0,
+                        help="number of past rollout snapshots kept for off-policy training of the "
+                             "DAE/GPAE heads (the actor stays on-policy PPO). 0 (default) disables replay. "
+                             "Replayed value targets use a V-trace-style truncated joint importance ratio "
+                             "on the difference-reward recursion; GPAE targets use DT-ISR traces.")
+    parser.add_argument("--dae_replay_updates", type=int, default=0,
+                        help="head updates per training iteration drawn from the replay store "
+                             "(each pass consumes one snapshot, split into dae_num_mini_batch minibatches).")
+    parser.add_argument("--dae_trace_eta", type=float, default=1.05,
+                        help="eta of the double-truncated importance sampling ratio (DT-ISR, GPAE paper "
+                             "Eq. 8): cap on the OTHER agents' joint ratio inside the per-agent trace "
+                             "c^k = lambda * min(1, rho^k * min(eta, rho^-k)).")
+
+    # anomaly-injection diagnostic (GPAE paper Sec. 3.1): force one agent to take a fixed
+    # suboptimal action with some probability and log the advantage gap
+    # dA = mean_{j != i} A_j - A_i at the injected steps. A larger gap means the
+    # per-agent advantage correctly penalizes the misbehaving agent.
+    parser.add_argument("--anomaly_agent_id", type=int, default=-1,
+                        help="agent index whose actions are randomly overridden for the credit-assignment "
+                             "diagnostic. -1 (default) disables the diagnostic.")
+    parser.add_argument("--anomaly_prob", type=float, default=0.05,
+                        help="per-step probability of overriding the anomaly agent's action.")
+    parser.add_argument("--anomaly_action", type=int, default=1,
+                        help="discrete action injected at anomaly steps (SMAC: 1 = stop).")
 
     # run parameters
     parser.add_argument("--use_linear_lr_decay", action='store_true',

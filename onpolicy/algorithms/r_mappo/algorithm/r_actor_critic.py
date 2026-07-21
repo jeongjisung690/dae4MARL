@@ -133,6 +133,46 @@ class R_Actor(nn.Module):
 
         return self.act.get_probs(actor_features, available_actions)
 
+    def get_action_probs_sequence(self, obs, rnn_states, masks, available_actions=None,
+                                  chunk_length=None):
+        """
+        Recompute action probabilities over full time-major sequences with the
+        CURRENT actor, rebuilding hidden states from the sequence start (needed
+        for replayed data, whose stored per-step hidden states are stale).
+        :param obs: (T * B, obs_dim) time-major flattened sequence.
+        :param rnn_states: (B, recurrent_N, hidden_size) hidden states at the sequence start.
+        :param masks: (T * B, 1) mask tensor; zeros reset hidden states at episode boundaries.
+        :param chunk_length: (int) BPTT truncation length (hidden states detached between chunks).
+        """
+        obs = check(obs).to(**self.tpdv)
+        rnn_states = check(rnn_states).to(**self.tpdv)
+        masks = check(masks).to(**self.tpdv)
+        if available_actions is not None:
+            available_actions = check(available_actions).to(**self.tpdv)
+
+        actor_features = self.base(obs)
+        if self._use_naive_recurrent_policy or self._use_recurrent_policy:
+            batch = rnn_states.size(0)
+            steps = actor_features.size(0) // batch
+            if chunk_length is None or chunk_length >= steps:
+                actor_features, _ = self.rnn(actor_features, rnn_states, masks)
+            else:
+                features = actor_features.view(steps, batch, -1)
+                seq_masks = masks.view(steps, batch, -1)
+                hxs = rnn_states
+                outputs = []
+                for start in range(0, steps, chunk_length):
+                    end = min(start + chunk_length, steps)
+                    chunk_features, hxs = self.rnn(
+                        features[start:end].reshape((end - start) * batch, -1),
+                        hxs,
+                        seq_masks[start:end].reshape((end - start) * batch, -1))
+                    hxs = hxs.detach()
+                    outputs.append(chunk_features)
+                actor_features = torch.cat(outputs, dim=0).view(steps * batch, -1)
+
+        return self.act.get_probs(actor_features, available_actions)
+
 
 class R_Critic(nn.Module):
     """
@@ -180,24 +220,58 @@ class R_Critic(nn.Module):
             if action_space.__class__.__name__ != "Discrete":
                 raise NotImplementedError("Initial DAE-MAPPO implementation supports Discrete action spaces.")
             self.action_dim = action_space.n
-            # small init gain for the output layer, following the official DAE
-            # implementation (module_gains: advantage_net=0.1)
+            self.dae_head_mode = getattr(args, "dae_head", "additive")
+            # ordered head conditions each agent's factor on preceding agents'
+            # actions: input gains one-hot slots for all agents (zero for
+            # non-predecessors) plus a predecessor mask.
+            adv_in_size = self.hidden_size
+            if self.dae_head_mode == "ordered":
+                adv_in_size += self.num_agents * self.action_dim + self.num_agents
+            # output-layer init gain: 1.0 reproduces the strong 7/14 baseline run;
+            # 0.1 is the official-DAE-style small init (see --dae_head_gain)
+            dae_head_gain = getattr(args, "dae_head_gain", 1.0)
             dae_head_hidden_size = getattr(args, "dae_head_hidden_size", 0)
             if dae_head_hidden_size > 0:
                 use_relu = args.use_ReLU
                 active_fn = nn.ReLU() if use_relu else nn.Tanh()
                 hidden_gain = nn.init.calculate_gain('relu' if use_relu else 'tanh')
                 self.adv_out = nn.Sequential(
-                    init(nn.Linear(self.hidden_size, dae_head_hidden_size),
+                    init(nn.Linear(adv_in_size, dae_head_hidden_size),
                          init_method, lambda x: nn.init.constant_(x, 0), gain=hidden_gain),
                     active_fn,
                     nn.LayerNorm(dae_head_hidden_size),
                     init(nn.Linear(dae_head_hidden_size, self.num_agents * self.action_dim),
-                         init_method, lambda x: nn.init.constant_(x, 0), gain=0.1),
+                         init_method, lambda x: nn.init.constant_(x, 0), gain=dae_head_gain),
                 )
             else:
-                self.adv_out = init(nn.Linear(self.hidden_size, self.num_agents * self.action_dim),
-                                    init_method, lambda x: nn.init.constant_(x, 0), gain=0.1)
+                self.adv_out = init(nn.Linear(adv_in_size, self.num_agents * self.action_dim),
+                                    init_method, lambda x: nn.init.constant_(x, 0), gain=dae_head_gain)
+
+            # GPAE auxiliary: dedicated counterfactual-value head E_Q^k(s, a_-k)
+            # (own-action-marginalized joint value). Separate parameters from
+            # adv_out so its reward-grounded target is not corrupted by the
+            # factor head's own decomposition errors; same input layout as the
+            # ordered head with a full prefix (all other agents' actions).
+            self.use_gpae_head = getattr(args, "dae_gpae_coef", 0.0) > 0.0
+            if self.use_gpae_head:
+                assert self.dae_head_mode == "ordered", \
+                    "the GPAE auxiliary loss requires dae_head=ordered."
+                eq_in_size = self.hidden_size + self.num_agents * self.action_dim + self.num_agents
+                if dae_head_hidden_size > 0:
+                    use_relu = args.use_ReLU
+                    active_fn = nn.ReLU() if use_relu else nn.Tanh()
+                    hidden_gain = nn.init.calculate_gain('relu' if use_relu else 'tanh')
+                    self.eq_out = nn.Sequential(
+                        init(nn.Linear(eq_in_size, dae_head_hidden_size),
+                             init_method, lambda x: nn.init.constant_(x, 0), gain=hidden_gain),
+                        active_fn,
+                        nn.LayerNorm(dae_head_hidden_size),
+                        init(nn.Linear(dae_head_hidden_size, self.num_agents),
+                             init_method, lambda x: nn.init.constant_(x, 0)),
+                    )
+                else:
+                    self.eq_out = init(nn.Linear(eq_in_size, self.num_agents),
+                                       init_method, lambda x: nn.init.constant_(x, 0))
 
         self.to(device)
 
@@ -211,7 +285,13 @@ class R_Critic(nn.Module):
             critic_features, rnn_states = self.rnn(critic_features, rnn_states, masks)
         return critic_features, rnn_states
 
-    def _advantage_table(self, critic_features):
+    def _advantage_table(self, critic_features, prefix_onehot=None, prefix_mask=None):
+        if self.dae_head_mode == "ordered":
+            if prefix_onehot is None or prefix_mask is None:
+                raise RuntimeError("ordered DAE head requires prefix_onehot and prefix_mask.")
+            prefix_onehot = check(prefix_onehot).to(**self.tpdv)
+            prefix_mask = check(prefix_mask).to(**self.tpdv)
+            critic_features = torch.cat([critic_features, prefix_onehot, prefix_mask], dim=-1)
         advantages = self.adv_out(critic_features)
         return advantages.view(-1, self.num_agents, self.action_dim)
 
@@ -329,3 +409,73 @@ class R_Critic(nn.Module):
         advantages = self._gather_joint_advantages(advantage_table, joint_actions)
 
         return values, advantages
+
+    def evaluate_factor_dae_sequence(self, cent_obs, rnn_states, masks, own_index, own_actions,
+                                     own_action_probs=None, prefix_onehot=None, prefix_mask=None,
+                                     chunk_length=None):
+        """
+        Evaluate values and each row's OWN per-agent advantage factor over full
+        time-major sequences with truncated BPTT. Rows follow the buffer layout
+        (T, envs, agents): row (t, b, k) yields agent k's centered factor
+        A_k(s, a_<k, a_k) (ordered head) or A_k(s, a_k) (additive head).
+        :param own_index: (T * B * N,) agent index of each row.
+        :param own_actions: (T * B * N, 1) discrete action taken by the row's agent.
+        :param own_action_probs: (T * B * N, action_dim) rollout-policy probabilities
+                                 of the row's agent, for exact centering (None disables).
+        :param prefix_onehot: (T * B * N, N * action_dim) predecessors' action one-hots
+                              (zero slots for non-predecessors); ordered head only.
+        :param prefix_mask: (T * B * N, N) predecessor indicator; ordered head only.
+        """
+        if not self._use_dae:
+            raise RuntimeError("evaluate_factor_dae_sequence called when DAE is disabled.")
+
+        critic_features = self._sequence_features(cent_obs, rnn_states, masks, chunk_length)
+        values = self.v_out(critic_features)
+        advantage_table = self._advantage_table(critic_features, prefix_onehot, prefix_mask)
+
+        own_index = check(own_index).to(device=self.tpdv["device"]).long().view(-1, 1, 1)
+        own_row = advantage_table.gather(dim=1, index=own_index.expand(-1, 1, self.action_dim)).squeeze(1)
+        if own_action_probs is not None:
+            own_action_probs = check(own_action_probs).to(**self.tpdv).view(-1, self.action_dim)
+            own_row = own_row - (own_action_probs * own_row).sum(dim=-1, keepdim=True)
+
+        own_actions = check(own_actions).to(device=self.tpdv["device"]).long().view(-1, 1)
+        own_actions = own_actions.clamp(min=0, max=self.action_dim - 1)
+        factors = own_row.gather(dim=-1, index=own_actions)
+
+        return values, factors
+
+    def evaluate_gpae_sequence(self, cent_obs, rnn_states, masks, own_index, own_actions,
+                               own_action_probs, prefix_onehot, prefix_mask, chunk_length=None):
+        """
+        Evaluate the GPAE pair for each buffer row (t, b, k), with the FULL
+        prefix (all agents j != k marked as predecessors):
+        - eq: E_Q^k(s, a_-k) from the dedicated counterfactual-value head
+          (normalized units, like v_out).
+        - factors: the ordered head's fully conditioned centered factor
+          A_k(s, a_-k, a_k) at the executed action (last-position factor).
+        :param prefix_onehot: (T * B * N, N * action_dim) all OTHER agents' action
+                              one-hots (full prefix).
+        :param prefix_mask: (T * B * N, N) 1 - eye pattern marking all others.
+        """
+        if not (self._use_dae and self.dae_head_mode == "ordered" and self.use_gpae_head):
+            raise RuntimeError("evaluate_gpae_sequence requires the ordered DAE head with the GPAE head enabled.")
+
+        prefix_onehot = check(prefix_onehot).to(**self.tpdv)
+        prefix_mask = check(prefix_mask).to(**self.tpdv)
+        own_index = check(own_index).to(device=self.tpdv["device"]).long().view(-1, 1)
+
+        critic_features = self._sequence_features(cent_obs, rnn_states, masks, chunk_length)
+        advantage_table = self._advantage_table(critic_features, prefix_onehot, prefix_mask)
+        own_row = advantage_table.gather(dim=1, index=own_index.view(-1, 1, 1).expand(-1, 1, self.action_dim)).squeeze(1)
+        if own_action_probs is not None:
+            own_action_probs = check(own_action_probs).to(**self.tpdv).view(-1, self.action_dim)
+            own_row = own_row - (own_action_probs * own_row).sum(dim=-1, keepdim=True)
+        own_actions = check(own_actions).to(device=self.tpdv["device"]).long().view(-1, 1)
+        own_actions = own_actions.clamp(min=0, max=self.action_dim - 1)
+        factors = own_row.gather(dim=-1, index=own_actions)
+
+        eq = self.eq_out(torch.cat([critic_features, prefix_onehot, prefix_mask], dim=-1))
+        eq = eq.gather(dim=-1, index=own_index)
+
+        return eq, factors

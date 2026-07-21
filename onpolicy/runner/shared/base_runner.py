@@ -9,6 +9,19 @@ def _t2n(x):
     """Convert torch tensor to a numpy array."""
     return x.detach().cpu().numpy()
 
+class _OverrideArgs(object):
+    """Proxy that overrides selected attributes and delegates the rest to the
+    wrapped args. Copying the args object itself is not safe: with wandb it is
+    a wandb.Config, and copy.copy leaves it uninitialized (infinite recursion
+    in its __getattr__)."""
+    def __init__(self, base, **overrides):
+        self._base = base
+        for key, value in overrides.items():
+            setattr(self, key, value)
+
+    def __getattr__(self, name):
+        return getattr(self.__dict__["_base"], name)
+
 class Runner(object):
     """
     Base class for training recurrent policies.
@@ -99,6 +112,21 @@ class Runner(object):
                                         share_observation_space,
                                         self.envs.action_space[0])
 
+        # rollout accumulation: aggregate buffer holding rollout_accumulation
+        # sequential chunks side by side along the thread dimension, so training
+        # sees an effective batch of n_rollout_threads * rollout_accumulation envs.
+        self.rollout_accumulation = getattr(self.all_args, "rollout_accumulation", 1)
+        if self.rollout_accumulation > 1:
+            agg_args = _OverrideArgs(self.all_args,
+                                     n_rollout_threads=self.n_rollout_threads * self.rollout_accumulation)
+            self.agg_buffer = SharedReplayBuffer(agg_args,
+                                                 self.num_agents,
+                                                 self.envs.observation_space[0],
+                                                 share_observation_space,
+                                                 self.envs.action_space[0])
+            self.agg_buffer.next_value = np.zeros_like(self.agg_buffer.value_preds[-1])
+            self._accumulated_chunks = 0
+
     def run(self):
         """Collect training data, perform training updates, and evaluate policy."""
         raise NotImplementedError
@@ -134,10 +162,51 @@ class Runner(object):
         next_values = np.array(np.split(_t2n(next_values), self.n_rollout_threads))
         self.buffer.compute_returns(next_values, self.trainer.value_normalizer)
     
+    @property
+    def train_buffer(self):
+        """Buffer the training update actually consumes."""
+        if self.rollout_accumulation > 1:
+            return self.agg_buffer
+        return self.buffer
+
+    def accumulate(self, chunk):
+        """Copy the collection buffer (with returns already computed) into the
+        aggregate buffer at the thread slice belonging to this chunk."""
+        n = self.n_rollout_threads
+        env_slice = slice(chunk * n, (chunk + 1) * n)
+        agg, buf = self.agg_buffer, self.buffer
+        agg.share_obs[:, env_slice] = buf.share_obs
+        agg.obs[:, env_slice] = buf.obs
+        agg.rnn_states[:, env_slice] = buf.rnn_states
+        agg.rnn_states_critic[:, env_slice] = buf.rnn_states_critic
+        agg.value_preds[:, env_slice] = buf.value_preds
+        agg.returns[:, env_slice] = buf.returns
+        agg.advantages[:, env_slice] = buf.advantages
+        agg.actions[:, env_slice] = buf.actions
+        agg.action_log_probs[:, env_slice] = buf.action_log_probs
+        agg.rewards[:, env_slice] = buf.rewards
+        agg.masks[:, env_slice] = buf.masks
+        agg.bad_masks[:, env_slice] = buf.bad_masks
+        agg.active_masks[:, env_slice] = buf.active_masks
+        if buf.available_actions is not None:
+            agg.available_actions[:, env_slice] = buf.available_actions
+        if getattr(buf, "anomaly_masks", None) is not None:
+            agg.anomaly_masks[:, env_slice] = buf.anomaly_masks
+        agg.next_value[env_slice] = buf.next_value
+        self._accumulated_chunks += 1
+
     def train(self):
         """Train policies with data in buffer. """
+        if self.rollout_accumulation > 1:
+            # guards against runners that run with rollout_accumulation > 1 but
+            # never call accumulate(), which would train on an all-zero buffer
+            assert self._accumulated_chunks == self.rollout_accumulation, (
+                "rollout_accumulation={} but only {} chunks were accumulated before train(); "
+                "this runner does not implement rollout accumulation.".format(
+                    self.rollout_accumulation, self._accumulated_chunks))
+            self._accumulated_chunks = 0
         self.trainer.prep_training()
-        train_infos = self.trainer.train(self.buffer)      
+        train_infos = self.trainer.train(self.train_buffer)
         self.buffer.after_update()
         return train_infos
 

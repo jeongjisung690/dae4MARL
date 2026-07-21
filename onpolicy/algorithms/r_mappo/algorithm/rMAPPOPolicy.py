@@ -117,11 +117,53 @@ class R_MAPPOPolicy:
                                                  joint_action_probs,
                                                  chunk_length)
 
+    def evaluate_factor_dae_sequence(self, cent_obs, rnn_states_critic, masks, own_index, own_actions,
+                                     own_action_probs=None, prefix_onehot=None, prefix_mask=None,
+                                     chunk_length=None):
+        """
+        Evaluate value and each agent's own (optionally ordered) centered DAE
+        advantage factor over full time-major sequences.
+        """
+        return self.critic.evaluate_factor_dae_sequence(cent_obs,
+                                                        rnn_states_critic,
+                                                        masks,
+                                                        own_index,
+                                                        own_actions,
+                                                        own_action_probs,
+                                                        prefix_onehot,
+                                                        prefix_mask,
+                                                        chunk_length)
+
+    def evaluate_gpae_sequence(self, cent_obs, rnn_states_critic, masks, own_index, own_actions,
+                               own_action_probs, prefix_onehot, prefix_mask, chunk_length=None):
+        """
+        Evaluate E_Q^k(s, a_-k) and the last-position (full-prefix) centered
+        factor for the GPAE auxiliary loss.
+        """
+        return self.critic.evaluate_gpae_sequence(cent_obs,
+                                                  rnn_states_critic,
+                                                  masks,
+                                                  own_index,
+                                                  own_actions,
+                                                  own_action_probs,
+                                                  prefix_onehot,
+                                                  prefix_mask,
+                                                  chunk_length)
+
     def get_action_probs(self, obs, rnn_states_actor, masks, available_actions=None):
         """
         Get factorized policy probabilities for exact DAE centering.
         """
         return self.actor.get_action_probs(obs, rnn_states_actor, masks, available_actions)
+
+    def get_action_probs_sequence(self, obs, rnn_states_actor, masks, available_actions=None,
+                                  chunk_length=None):
+        """
+        Recompute action probabilities over full time-major sequences with the
+        current actor (for replayed data with stale stored hidden states).
+        """
+        return self.actor.get_action_probs_sequence(obs, rnn_states_actor, masks,
+                                                    available_actions, chunk_length)
 
     def evaluate_actions(self, cent_obs, obs, rnn_states_actor, rnn_states_critic, action, masks,
                          available_actions=None, active_masks=None):

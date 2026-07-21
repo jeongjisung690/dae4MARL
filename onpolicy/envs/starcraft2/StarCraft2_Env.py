@@ -11,11 +11,13 @@ from copy import deepcopy
 import numpy as np
 import enum
 import math
+import time
 from absl import logging
 
 from pysc2 import maps
 from pysc2 import run_configs
 from pysc2.lib import protocol
+from pysc2.lib import remote_controller
 
 from s2clientprotocol import common_pb2 as sc_common
 from s2clientprotocol import sc2api_pb2 as sc_pb
@@ -447,9 +449,33 @@ class StarCraft2Env(MultiAgentEnv):
             self.full_restart()
 
     def full_restart(self):
-        """Full restart. Closes the SC2 process and launches a new one. """
-        self._sc2_proc.close()
-        self._launch()
+        """Full restart. Closes the SC2 process and launches a new one.
+
+        Launching can itself fail (e.g. join_game websocket timeouts when
+        many SC2 processes restart simultaneously), so retry with backoff
+        instead of letting the exception kill the env worker.
+        """
+        max_retries = 5
+        for attempt in range(max_retries):
+            try:
+                if self._sc2_proc is not None:
+                    self._sc2_proc.close()
+            except Exception:
+                pass
+            self._sc2_proc = None
+            self._controller = None
+            try:
+                self._launch()
+                break
+            except (protocol.ProtocolError, protocol.ConnectionError,
+                    remote_controller.ConnectError) as e:
+                if attempt == max_retries - 1:
+                    raise
+                wait = 15 * (attempt + 1)
+                logging.error(
+                    "full_restart attempt %d/%d failed (%s), retrying in %ds",
+                    attempt + 1, max_retries, e, wait)
+                time.sleep(wait)
         self.force_restarts += 1
 
     def step(self, actions):

@@ -13,11 +13,53 @@ class SMACRunner(Runner):
     def __init__(self, config):
         super(SMACRunner, self).__init__(config)
 
+        # anomaly-injection diagnostic: override one agent's action with a fixed
+        # suboptimal action at random steps; the trainer logs the advantage gap
+        # at those steps (see r_mappo train_info['anomaly_adv_gap']).
+        self.anomaly_agent_id = getattr(self.all_args, "anomaly_agent_id", -1)
+        self.anomaly_prob = getattr(self.all_args, "anomaly_prob", 0.05)
+        self.anomaly_action = getattr(self.all_args, "anomaly_action", 1)
+        if self.anomaly_agent_id >= 0:
+            assert self.anomaly_agent_id < self.num_agents, "anomaly_agent_id out of range"
+            self.buffer.anomaly_masks = np.zeros(
+                (self.episode_length, self.n_rollout_threads, 1), dtype=np.float32)
+            if self.rollout_accumulation > 1:
+                self.agg_buffer.anomaly_masks = np.zeros(
+                    (self.episode_length, self.n_rollout_threads * self.rollout_accumulation, 1),
+                    dtype=np.float32)
+
+    def _inject_anomaly(self, step, actions, action_log_probs):
+        """
+        With probability anomaly_prob per env, replace the anomaly agent's sampled
+        action with the fixed anomaly action (if available). The stored log-prob is
+        replaced with log pi(anomaly_action) so the PPO ratio stays consistent with
+        the action actually recorded in the buffer.
+        """
+        agent = self.anomaly_agent_id
+        available = self.buffer.available_actions[step][:, agent]
+        can_inject = available[:, self.anomaly_action] == 1
+        trigger = (np.random.rand(self.n_rollout_threads) < self.anomaly_prob) & can_inject
+        self.buffer.anomaly_masks[step] = trigger[:, None].astype(np.float32)
+        if not trigger.any():
+            return actions, action_log_probs
+
+        probs = self.trainer.policy.get_action_probs(self.buffer.obs[step][:, agent],
+                                                     self.buffer.rnn_states[step][:, agent],
+                                                     self.buffer.masks[step][:, agent],
+                                                     available)
+        probs = _t2n(probs)
+        actions = actions.copy()
+        action_log_probs = action_log_probs.copy()
+        actions[trigger, agent, 0] = self.anomaly_action
+        action_log_probs[trigger, agent, 0] = np.log(probs[trigger, self.anomaly_action] + 1e-10)
+        return actions, action_log_probs
+
     def run(self):
         self.warmup()   
 
         start = time.time()
-        episodes = int(self.num_env_steps) // self.episode_length // self.n_rollout_threads
+        steps_per_update = self.episode_length * self.n_rollout_threads * self.rollout_accumulation
+        episodes = int(self.num_env_steps) // steps_per_update
 
         last_battles_game = np.zeros(self.n_rollout_threads, dtype=np.float32)
         last_battles_won = np.zeros(self.n_rollout_threads, dtype=np.float32)
@@ -26,26 +68,39 @@ class SMACRunner(Runner):
             if self.use_linear_lr_decay:
                 self.trainer.policy.lr_decay(episode, episodes)
 
-            for step in range(self.episode_length):
-                # Sample actions
-                values, actions, action_log_probs, rnn_states, rnn_states_critic = self.collect(step)
-                    
-                # Obser reward and next obs
-                obs, share_obs, rewards, dones, infos, available_actions = self.envs.step(np.squeeze(actions, axis=-1))
+            # collect rollout_accumulation sequential chunks with the same policy;
+            # concatenated along the thread dimension they form one on-policy batch
+            # equivalent to n_rollout_threads * rollout_accumulation parallel envs.
+            for chunk in range(self.rollout_accumulation):
+                for step in range(self.episode_length):
+                    # Sample actions
+                    values, actions, action_log_probs, rnn_states, rnn_states_critic = self.collect(step)
 
-                data = obs, share_obs, rewards, dones, infos, available_actions, \
-                       values, actions, action_log_probs, \
-                       rnn_states, rnn_states_critic 
-                
-                # insert data into buffer
-                self.insert(data)
+                    # Obser reward and next obs
+                    obs, share_obs, rewards, dones, infos, available_actions = self.envs.step(np.squeeze(actions, axis=-1))
 
-            # compute return and update network
-            self.compute()
+                    data = obs, share_obs, rewards, dones, infos, available_actions, \
+                           values, actions, action_log_probs, \
+                           rnn_states, rnn_states_critic
+
+                    # insert data into buffer
+                    self.insert(data)
+
+                # compute returns for this chunk (GAE is per-thread, so per-chunk
+                # computation is identical to computing it on the aggregate batch)
+                self.compute()
+                if self.rollout_accumulation > 1:
+                    self.accumulate(chunk)
+                    if chunk < self.rollout_accumulation - 1:
+                        # carry the last step over so the next chunk continues the envs
+                        self.buffer.after_update()
+
+            # update network (self.train() consumes self.train_buffer and calls
+            # after_update on the collection buffer)
             train_infos = self.train()
-            
+
             # post process
-            total_num_steps = (episode + 1) * self.episode_length * self.n_rollout_threads           
+            total_num_steps = (episode + 1) * steps_per_update
             # save model
             if (episode % self.save_interval == 0 or episode == episodes - 1):
                 self.save()
@@ -87,7 +142,7 @@ class SMACRunner(Runner):
                     last_battles_game = battles_game
                     last_battles_won = battles_won
 
-                train_infos['dead_ratio'] = 1 - self.buffer.active_masks.sum() / reduce(lambda x, y: x*y, list(self.buffer.active_masks.shape)) 
+                train_infos['dead_ratio'] = 1 - self.train_buffer.active_masks.sum() / reduce(lambda x, y: x*y, list(self.train_buffer.active_masks.shape))
                 
                 self.log_train(train_infos, total_num_steps)
 
@@ -124,6 +179,9 @@ class SMACRunner(Runner):
         rnn_states = np.array(np.split(_t2n(rnn_state), self.n_rollout_threads))
         rnn_states_critic = np.array(np.split(_t2n(rnn_state_critic), self.n_rollout_threads))
 
+        if self.anomaly_agent_id >= 0:
+            actions, action_log_probs = self._inject_anomaly(step, actions, action_log_probs)
+
         return values, actions, action_log_probs, rnn_states, rnn_states_critic
 
     def insert(self, data):
@@ -151,7 +209,7 @@ class SMACRunner(Runner):
                            actions, action_log_probs, values, rewards, masks, bad_masks, active_masks, available_actions)
 
     def log_train(self, train_infos, total_num_steps):
-        train_infos["average_step_rewards"] = np.mean(self.buffer.rewards)
+        train_infos["average_step_rewards"] = np.mean(self.train_buffer.rewards)
         for k, v in train_infos.items():
             if self.use_wandb:
                 wandb.log({k: v}, step=total_num_steps)
